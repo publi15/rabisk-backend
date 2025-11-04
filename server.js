@@ -1,71 +1,119 @@
-// server.js — VERSÃO FINAL QUE FUNCIONA COM R$1,00
+// server.js
 require("dotenv").config();
 const express = require("express");
+const cors = require("cors");
 const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
 
 const app = express();
 
-// 1. CORS PERFEITO
-app.use((req, res, next) => {
-  res.header("Access-Control-Allow-Origin", process.env.FRONTEND_URL || "http://localhost:5173");
-  res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.header("Access-Control-Allow-Headers", "Content-Type, stripe-signature");
-  if (req.method === "OPTIONS") return res.status(200).end();
-  next();
+const allowedOrigins = [
+  "https://rabisk-frontend.vercel.app", // ⬅️ SUA URL DE PRODUÇÃO NO VERCEL
+  "http://localhost:5173", // URL para desenvolvimento local
+];
+
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      // Permite requisições sem 'origin' (como apps ou ferramentas)
+      // OU se a origem estiver na nossa lista (Vercel ou localhost)
+      if (!origin || allowedOrigins.includes(origin)) {
+        callback(null, true);
+      } else {
+        // Se for outra origem, bloqueia o CORS (segurança)
+        callback(new Error("Not allowed by CORS"));
+      }
+    },
+    methods: "GET,HEAD,PUT,PATCH,POST,DELETE",
+    credentials: true,
+  })
+);
+
+// Rota raiz
+app.get("/", (req, res) => {
+  res.send("BACKEND DO RABISK ESTÁ VIVO! 🚀");
 });
 
-// 2. RAIZ
-app.get("/", (req, res) => res.send("BACKEND RABISK2D VIVO! 🚀"));
-
-// 3. CRIA CHECKOUT (agora com rota correta)
-app.post("/create-checkout-session", express.json(), async (req, res) => {
+// CRIA CHECKOUT SESSION
+app.post("/create-checkout", express.json(), async (req, res) => {
   const { plan } = req.body;
-  if (!["lifetime", "subscription"].includes(plan)) return res.status(400).json({ error: "Plano inválido" });
 
-  const priceId = plan === "lifetime" 
-    ? process.env.STRIPE_PRICE_ID_VITALICIA 
-    : process.env.STRIPE_PRICE_ID_ASSINATURA;
+  // VALIDAÇÃO
+  if (!plan || !["lifetime", "subscription"].includes(plan)) {
+    return res.status(400).json({ error: "Plano inválido" });
+  }
+
+  const priceId =
+    plan === "lifetime"
+      ? process.env.STRIPE_PRICE_ID_VITALICIA
+      : process.env.STRIPE_PRICE_ID_ASSINATURA;
+
+  if (!priceId) {
+    return res.status(500).json({ error: "ID do preço não configurado" });
+  }
 
   try {
     const session = await stripe.checkout.sessions.create({
       payment_method_types: ["card"],
-      line_items: [{ price: priceId, quantity: 1 }],
+      line_items: [
+        {
+          price: priceId,
+          quantity: 1,
+        },
+      ],
       mode: plan === "lifetime" ? "payment" : "subscription",
       success_url: `${process.env.FRONTEND_URL}/obrigado?session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `${process.env.FRONTEND_URL}/#planos`,
+      metadata: { plan },
     });
+
     res.json({ url: session.url });
   } catch (err) {
-    console.error("ERRO CHECKOUT:", err.message);
-    res.status(500).json({ error: err.message });
+    console.error("ERRO AO CRIAR SESSÃO:", err.message);
+    res.status(500).json({ error: "Falha ao criar sessão de pagamento" });
   }
 });
 
-// 4. WEBHOOK (RAW + VERIFICAÇÃO)
+// WEBHOOK (DEVE VIR ANTES DE express.json())
 app.post("/webhook", express.raw({ type: "application/json" }), (req, res) => {
   const sig = req.headers["stripe-signature"];
+
   let event;
   try {
-    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
+    event = stripe.webhooks.constructEvent(
+      req.body,
+      sig,
+      process.env.STRIPE_WEBHOOK_SECRET
+    );
   } catch (err) {
-    console.log(`WEBHOOK ERRO: ${err.message}`);
+    console.log(`ERRO NO WEBHOOK: ${err.message}`);
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
+  // SUCESSO NO PAGAMENTO
   if (event.type === "checkout.session.completed") {
     const session = event.data.object;
-    console.log("\n🎉 PAGAMENTO RECEBIDO!");
-    console.log(`Plano: ${session.metadata.plan === "lifetime" ? "VITALÍCIO" : "MENSAL"}`);
-    console.log(`Email: ${session.customer_details?.email}`);
-    console.log(`ID: ${session.id}\n`);
+    const plan = session.metadata?.plan || "desconhecido";
+
+    console.log("\n");
+    console.log("==================================");
+    console.log("PAGAMENTO RECEBIDO!");
+    console.log(`Plano: ${plan === "lifetime" ? "VITALÍCIO" : "MENSAL"}`);
+    console.log(`Email: ${session.customer_details?.email || "não informado"}`);
+    console.log(`ID: ${session.id}`);
+    console.log("==================================");
+    console.log("\n");
+
+    // AQUI VOCÊ PODE SALVAR NO BANCO, ENVIAR EMAIL, ETC
   }
+
   res.json({ received: true });
 });
 
-// 5. START
-const PORT = process.env.PORT || 4242;
+// INICIA SERVIDOR
+const PORT = 4242;
 app.listen(PORT, () => {
-  console.log(`SERVIDOR ON FIRE: ${process.env.FRONTEND_URL}`);
-  console.log(`CHECKOUT → POST /create-checkout-session`);
-  console.log(`WEBHOOK → POST /webhook`);
+  console.log(`SERVIDOR RODANDO EM http://localhost:${PORT}`);
+  console.log(`CHECKOUT: POST /create-checkout`);
+  console.log(`WEBHOOK: POST /webhook`);
+  console.log(`TESTE: stripe trigger checkout.session.completed`);
 });
