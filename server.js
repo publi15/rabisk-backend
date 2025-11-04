@@ -1,3 +1,5 @@
+import cors from "cors";
+
 // server.js — VERSÃO FINAL QUE FUNCIONA COM R$1,00
 require("dotenv").config();
 const express = require("express");
