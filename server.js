@@ -2,10 +2,22 @@
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
+const helmet = require("helmet"); // 🛡️ SEGURANÇA
+const rateLimit = require("express-rate-limit"); // ⏱️ LIMITE DE REQUISIÇÕES
 const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
 
 const app = express();
 
+// ===== CONFIGURAÇÃO DO HELMET (SEGURANÇA) =====
+// Adiciona headers de segurança HTTP automaticamente
+app.use(
+  helmet({
+    contentSecurityPolicy: false, // Desabilita CSP para não interferir com Stripe
+    crossOriginEmbedderPolicy: false, // Permite embedar recursos externos
+  })
+);
+
+// ===== CONFIGURAÇÃO DO CORS =====
 const allowedOrigins = [
   "https://rabisk-frontend.vercel.app", // ⬅️ SUA URL DE PRODUÇÃO NO VERCEL
   "http://localhost:5173", // URL para desenvolvimento local
@@ -28,52 +40,100 @@ app.use(
   })
 );
 
+// ===== CONFIGURAÇÃO DE RATE LIMITING =====
+
+// Rate Limiter GERAL (para todas as rotas, exceto webhook)
+// Limita a 100 requisições por 15 minutos por IP
+const generalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutos
+  max: 100, // Máximo de 100 requisições por janela de tempo
+  message: {
+    error: "Muitas requisições deste IP, tente novamente em 15 minutos.",
+  },
+  standardHeaders: true, // Retorna informações de rate limit nos headers `RateLimit-*`
+  legacyHeaders: false, // Desabilita os headers `X-RateLimit-*`
+});
+
+// Rate Limiter para CHECKOUT (mais restritivo)
+// Limita a 5 tentativas de checkout por 15 minutos por IP
+const checkoutLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutos
+  max: 5, // Máximo de 5 tentativas de checkout
+  message: {
+    error: "Muitas tentativas de checkout. Tente novamente em 15 minutos.",
+  },
+  standardHeaders: true,
+  legacyHeaders: false,
+  // Ignora requisições bem-sucedidas (só conta falhas/tentativas)
+  skipSuccessfulRequests: false,
+});
+
+// Aplicar rate limiter geral em todas as rotas (exceto webhook)
+app.use((req, res, next) => {
+  // Webhook do Stripe NÃO deve ter rate limit (ou o Stripe pode falhar)
+  if (req.path === "/webhook") {
+    return next();
+  }
+  generalLimiter(req, res, next);
+});
+
+// ===== ROTAS =====
+
 // Rota raiz
 app.get("/", (req, res) => {
-  res.send("BACKEND DO RABISK ESTÁ VIVO! 🚀");
+  res.json({
+    message: "BACKEND DO RABISK ESTÁ VIVO!",
+    security: "Helmet ativado",
+    rateLimit: "Ativo",
+  });
 });
 
-// CRIA CHECKOUT SESSION
-app.post("/create-checkout", express.json(), async (req, res) => {
-  const { plan } = req.body;
+// CRIA CHECKOUT SESSION (com rate limit específico)
+app.post(
+  "/create-checkout",
+  checkoutLimiter, // ⬅️ Rate limit específico para checkout
+  express.json(),
+  async (req, res) => {
+    const { plan } = req.body;
 
-  // VALIDAÇÃO
-  if (!plan || !["lifetime", "subscription"].includes(plan)) {
-    return res.status(400).json({ error: "Plano inválido" });
+    // VALIDAÇÃO
+    if (!plan || !["lifetime", "subscription"].includes(plan)) {
+      return res.status(400).json({ error: "Plano inválido" });
+    }
+
+    const priceId =
+      plan === "lifetime"
+        ? process.env.STRIPE_PRICE_ID_VITALICIA
+        : process.env.STRIPE_PRICE_ID_ASSINATURA;
+
+    if (!priceId) {
+      return res.status(500).json({ error: "ID do preço não configurado" });
+    }
+
+    try {
+      const session = await stripe.checkout.sessions.create({
+        payment_method_types: ["card"],
+        line_items: [
+          {
+            price: priceId,
+            quantity: 1,
+          },
+        ],
+        mode: plan === "lifetime" ? "payment" : "subscription",
+        success_url: `${process.env.FRONTEND_URL}/obrigado?session_id={CHECKOUT_SESSION_ID}`,
+        cancel_url: `${process.env.FRONTEND_URL}/#planos`,
+        metadata: { plan },
+      });
+
+      res.json({ url: session.url });
+    } catch (err) {
+      console.error("ERRO AO CRIAR SESSÃO:", err.message);
+      res.status(500).json({ error: "Falha ao criar sessão de pagamento" });
+    }
   }
+);
 
-  const priceId =
-    plan === "lifetime"
-      ? process.env.STRIPE_PRICE_ID_VITALICIA
-      : process.env.STRIPE_PRICE_ID_ASSINATURA;
-
-  if (!priceId) {
-    return res.status(500).json({ error: "ID do preço não configurado" });
-  }
-
-  try {
-    const session = await stripe.checkout.sessions.create({
-      payment_method_types: ["card"],
-      line_items: [
-        {
-          price: priceId,
-          quantity: 1,
-        },
-      ],
-      mode: plan === "lifetime" ? "payment" : "subscription",
-      success_url: `${process.env.FRONTEND_URL}/obrigado?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${process.env.FRONTEND_URL}/#planos`,
-      metadata: { plan },
-    });
-
-    res.json({ url: session.url });
-  } catch (err) {
-    console.error("ERRO AO CRIAR SESSÃO:", err.message);
-    res.status(500).json({ error: "Falha ao criar sessão de pagamento" });
-  }
-});
-
-// WEBHOOK (DEVE VIR ANTES DE express.json())
+// WEBHOOK (DEVE VIR ANTES de express.json() e SEM rate limit)
 app.post("/webhook", express.raw({ type: "application/json" }), (req, res) => {
   const sig = req.headers["stripe-signature"];
 
@@ -110,10 +170,16 @@ app.post("/webhook", express.raw({ type: "application/json" }), (req, res) => {
 });
 
 // INICIA SERVIDOR
-const PORT = 4242;
+const PORT = process.env.PORT || 4242;
 app.listen(PORT, () => {
-  console.log(`SERVIDOR RODANDO EM http://localhost:${PORT}`);
-  console.log(`CHECKOUT: POST /create-checkout`);
-  console.log(`WEBHOOK: POST /webhook`);
-  console.log(`TESTE: stripe trigger checkout.session.completed`);
+  console.log(`\n SERVIDOR RODANDO EM http://localhost:${PORT}`);
+  console.log(` Helmet: ATIVO`);
+  console.log(` Rate Limit: ATIVO`);
+  console.log(`   - Geral: 100 req/15min`);
+  console.log(`   - Checkout: 5 req/15min`);
+  console.log(`\n ROTAS DISPONÍVEIS:`);
+  console.log(`   GET  / - Status do servidor`);
+  console.log(`   POST /create-checkout - Criar sessão de pagamento`);
+  console.log(`   POST /webhook - Webhook do Stripe`);
+  console.log(`\n TESTE: stripe trigger checkout.session.completed\n`);
 });
