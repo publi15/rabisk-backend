@@ -5,6 +5,8 @@ const cors = require("cors");
 const helmet = require("helmet"); // 🛡️ SEGURANÇA
 const rateLimit = require("express-rate-limit"); // ⏱️ LIMITE DE REQUISIÇÕES
 const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
+const { pool } = require("./database");
+const { generateUniqueKey } = require("./utils/keyGenerator"); // Verifique o nome do arquivo, o seu está como keyGenerate.js
 
 const app = express();
 
@@ -134,7 +136,7 @@ app.post(
 );
 
 // WEBHOOK (DEVE VIR ANTES de express.json() e SEM rate limit)
-app.post("/webhook", express.raw({ type: "application/json" }), (req, res) => {
+app.post("/webhook", express.raw({ type: "application/json" }), async (req, res) => {
   const sig = req.headers["stripe-signature"];
 
   let event;
@@ -163,10 +165,83 @@ app.post("/webhook", express.raw({ type: "application/json" }), (req, res) => {
     console.log("==================================");
     console.log("\n");
 
-    // AQUI VOCÊ PODE SALVAR NO BANCO, ENVIAR EMAIL, ETC
+    // AQUI VAMOS SALVAR NO BANCO!
+    try {
+      // 1. Gerar uma chave única
+      const newKey = await generateUniqueKey();
+
+      // 2. Pegar os dados do cliente
+      const customerEmail = session.customer_details?.email;
+      const customerId = session.customer;
+      const sessionId = session.id;
+
+      // 3. Inserir no banco de dados (SQL!)
+      const queryText = `
+    INSERT INTO access_keys (key, email, plan, stripe_session_id, stripe_customer_id, is_active)
+    VALUES ($1, $2, $3, $4, $5, $6)
+    RETURNING id;
+  `;
+
+      const queryParams = [
+        newKey,
+        customerEmail,
+        plan,
+        sessionId,
+        customerId,
+        true
+      ];
+
+      await pool.query(queryText, queryParams);
+
+      console.log(`✅ CHAVE GERADA E SALVA: ${newKey} para ${customerEmail}`);
+
+    } catch (dbError) {
+      console.error("❌ ERRO AO SALVAR CHAVE NO BANCO:", dbError);
+    }
   }
 
   res.json({ received: true });
+});
+
+/**
+ * ROTA: ✅ Validar Chave de Acesso
+ */
+app.post("/validate-key", express.json(), async (req, res) => {
+  try {
+    const { key } = req.body; // Pega a chave do corpo da requisição
+
+    if (!key) {
+      return res.status(400).json({ valid: false, error: "Chave não fornecida" });
+    }
+
+    // Faz a consulta SQL no Supabase
+    const result = await pool.query(
+      "SELECT * FROM access_keys WHERE key = $1",
+      [key.toUpperCase()]
+    );
+
+    const accessKey = result.rows[0];
+
+    if (!accessKey) {
+      return res.status(404).json({ valid: false, error: "Chave não encontrada" });
+    }
+
+    if (!accessKey.is_active) {
+      return res.status(403).json({ valid: false, error: "Chave inativa ou expirada" });
+    }
+
+    // Sucesso! A chave é válida.
+    res.json({
+      valid: true,
+      plan: accessKey.plan,
+      email: accessKey.email,
+      message: "Chave válida! Acesso liberado."
+    });
+
+  } catch (error) {
+    console.error("❌ Erro ao validar chave:", error);
+    res.status(500).json({ valid: false, error: "Erro interno do servidor" });
+  }
 });
 
 // INICIA SERVIDOR
