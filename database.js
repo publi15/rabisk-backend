@@ -1,25 +1,23 @@
+// database.js
 require('dotenv').config();
 const { Pool } = require('pg');
 
 const connectionString = process.env.DATABASE_URL;
 
 if (!connectionString) {
-  throw new Error("DATABASE_URL não foi definida no arquivo .env");
+  console.error("❌ ERRO CRÍTICO: DATABASE_URL faltando no .env");
+  process.exit(1); // Encerra o app se não tiver banco
 }
 
 const pool = new Pool({
-  connectionString: connectionString,
+  connectionString,
   ssl: {
-    rejectUnauthorized: false 
+    rejectUnauthorized: false // Necessário para Supabase em alguns ambientes Node
   }
 });
 
-pool.query('SELECT NOW()', (err, res) => {
-  if (err) {
-    console.error('❌ Erro ao conectar ao PostgreSQL:', err.message);
-  } else {
-    console.log('✅ PostgreSQL (Supabase) conectado com sucesso!');
-  }
+pool.on('error', (err) => {
+  console.error('❌ Erro inesperado no cliente PostgreSQL', err);
 });
 
 module.exports = { pool };
